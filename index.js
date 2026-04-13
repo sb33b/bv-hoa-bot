@@ -320,39 +320,44 @@ async function checkConflict(sport, court, date, start_hour, end_hour) {
   const newStart = start_hour * 60;
   const newEnd = end_hour * 60;
 
-  let query = firestore.collection('bookings')
-    .where('date', '==', date);
+  const snapshot = await firestore.collection('bookings')
+    .where('date', '==', date)
+    .get();
 
-  const snapshot = await query.get();
-
-  const hasConflict = snapshot.docs.some(doc => {
+  return snapshot.docs.some(doc => {
     const b = doc.data();
 
     const existingStart = b.start_hour * 60;
     const existingEnd = b.end_hour * 60;
 
-    // Table tennis is fully isolated
+    const timeOverlap =
+      existingStart < newEnd && existingEnd > newStart;
+
+    if (!timeOverlap) return false;
+
+    // -----------------------------
+    // 1. Table Tennis is isolated
+    // -----------------------------
     if (court === 'Table Tennis' || b.court === 'Table Tennis') {
-      return court === 'Table Tennis' && b.court === 'Table Tennis' &&
-        existingStart < newEnd &&
-        existingEnd > newStart;
+      return court === 'Table Tennis' && b.court === 'Table Tennis';
     }
 
-    // FULL court booking logic
-    const isFullExisting = b.court === 'FULL';
-    const isFullNew = court === 'FULL';
+    // -----------------------------
+    // 2. FULL court rules
+    // -----------------------------
+    const newIsFull = court === 'FULL';
+    const existingIsFull = b.court === 'FULL';
 
-    const sameCourtConflict =
-      b.court === court || isFullExisting || isFullNew;
+    if (newIsFull || existingIsFull) {
+      // FULL blocks ANY A/B/C and vice versa
+      return true;
+    }
 
-    return (
-      sameCourtConflict &&
-      existingStart < newEnd &&
-      existingEnd > newStart
-    );
+    // -----------------------------
+    // 3. Normal courts (A/B/C)
+    // -----------------------------
+    return b.court === court;
   });
-
-  return hasConflict;
 }
 
 async function sendCancelRedirect(senderId) {
