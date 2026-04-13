@@ -252,9 +252,10 @@ Extract booking details from the user's message and return ONLY a valid JSON obj
 Format:
 {
   "sport": "Basketball" | "Pickleball" | "Table Tennis" | null,
-  "court": "A" | "B" | "C" | "Table Tennis" | null,
+  "court": "A" | "B" | "C" | "Table Tennis" | "Full" | null,
   "date": "YYYY-MM-DD" | null,
-  "hour": <integer 18-21, 24hr format> | null,
+  "start_hour": <integer 18-21, 24hr format> | null,
+  "end_hour": <integer 19-22, 24hr format> | null,
   "name": "<person's name>" | null,
   "unit": "###" | null
 }
@@ -274,19 +275,23 @@ Basketball and Pickleball use courts A, B, or C.`
   }
 
   // Validate required fields
-  if (!parsed.sport || !parsed.court || !parsed.date || parsed.hour === null || !parsed.name || !parsed.unit) {
+  if (!parsed.sport || !parsed.court || !parsed.date || parsed.start_hour === null || !parsed.name || !parsed.unit) {
     await sendText(senderId,
-      `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Time (e.g. 7pm)\n• Your name\n• Your unit number`
+      `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Start Time (e.g. 7pm)\n• Your name\n• Your unit number`
     );
     return;
   }
 
+  if(parsed.end_hour === null) {
+    parsed.end_hour = parsed.start_hour + 1; // Default to 1 hour booking if end time not provided
+  }
+
   // Conflict check
-  const hasConflict = await checkConflict(parsed.sport, parsed.court, parsed.date, parsed.hour);
+  const hasConflict = await checkConflict(parsed.sport, parsed.court, parsed.date, parsed.start_hour, parsed.end_hour);
   if (hasConflict) {
     const timeStr = formatHour(parsed.hour);
     await sendText(senderId,
-      `❌ Sorry! ${parsed.sport} Court ${parsed.court} is already booked on ${parsed.date} at ${timeStr}.\n\nPlease choose a different time or court.`
+      `❌ Sorry! ${parsed.sport} Court ${parsed.court} is already booked on ${parsed.date} at ${parsed.start_hour} to ${parsed.end_hour}.\n\nPlease choose a different time or court.`
     );
     sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
     return;
@@ -297,41 +302,72 @@ Basketball and Pickleball use courts A, B, or C.`
     sport: parsed.sport,
     court: parsed.court,
     date: parsed.date,
-    hour: parsed.hour,
+    start_hour: parsed.start_hour,
+    end_hour: parsed.end_hour,
     unit: parsed.unit,
     bookedBy: parsed.name,
     messengerUserId: senderId,
     createdAt: Firestore.Timestamp.now(),
   });
 
-  const timeStr = formatHour(parsed.hour);
   await sendText(senderId,
-    `✅ Booking confirmed!\n\n🏟️ ${parsed.sport} — Court ${parsed.court}\n📅 ${parsed.date}\n🕐 ${timeStr}–${formatHour(parsed.hour + 1)}\n👤 ${parsed.name}\n\nEnjoy your game! 🎉`
+    `✅ Booking confirmed!\n\n🏟️ ${parsed.sport} — Court ${parsed.court}\n📅 ${parsed.date}\n🕐 ${formatHour(parsed.start_hour)}–${formatHour(parsed.end_hour)}\n👤 ${parsed.name}\n\nEnjoy your game! 🎉`
   );
   sessions[senderId] = null;
 }
 
-async function checkConflict(sport, court, date, hour) {
-  // For shared courts (A, B, C): Basketball and Pickleball share the same physical court
-  // So we block by court + date + hour regardless of sport
-  let query;
+async function checkConflict(sport, court, date, start_hour, end_hour) {
+  const newStart = start_hour * 60;
+  const newEnd = end_hour * 60;
 
-  if (court === 'Table Tennis') {
-    // Table Tennis has its own court — only conflicts with other Table Tennis bookings
-    query = firestore.collection('bookings')
-      .where('court', '==', 'Table Tennis')
-      .where('date', '==', date)
-      .where('hour', '==', hour);
-  } else {
-    // Shared courts — conflict if ANY sport booked same court/date/hour
-    query = firestore.collection('bookings')
-      .where('court', '==', court)
-      .where('date', '==', date)
-      .where('hour', '==', hour);
-  }
+  let query = firestore.collection('bookings')
+    .where('date', '==', date);
 
   const snapshot = await query.get();
-  return !snapshot.empty;
+
+  const hasConflict = snapshot.docs.some(doc => {
+    const b = doc.data();
+
+    const existingStart = b.start_hour * 60;
+    const existingEnd = b.end_hour * 60;
+
+    // Table tennis is fully isolated
+    if (court === 'Table Tennis' || b.court === 'Table Tennis') {
+      return court === 'Table Tennis' && b.court === 'Table Tennis' &&
+        existingStart < newEnd &&
+        existingEnd > newStart;
+    }
+
+    // FULL court booking logic
+    const isFullExisting = b.court === 'FULL';
+    const isFullNew = court === 'FULL';
+
+    const sameCourtConflict =
+      b.court === court || isFullExisting || isFullNew;
+
+    return (
+      sameCourtConflict &&
+      existingStart < newEnd &&
+      existingEnd > newStart
+    );
+  });
+
+  return hasConflict;
+}
+
+  const snapshot = await query.get();
+
+  // 🔥 Proper overlap check (done in memory)
+  const hasConflict = snapshot.docs.some(doc => {
+    const b = doc.data();
+
+    return (
+      b.start_minute < end_minute &&
+      b.end_minute > start_minute
+    );
+  });
+
+  return hasConflict;
 }
 
 async function sendCancelRedirect(senderId) {
@@ -371,22 +407,38 @@ async function sendCalendarImage(senderId, week) {
     .where('date', '<=', endDate)
     .get();
 
-  // Organise: bookingMap[date][hour] = [label, ...]
-  const bookingMap = {};
+  // -----------------------------
+  // Normalize bookings (interval model)
+  // -----------------------------
+  const bookingsByDate = {};
+
   snapshot.forEach(doc => {
     const b = doc.data();
-    if (!bookingMap[b.date]) bookingMap[b.date] = {};
-    if (!bookingMap[b.date][b.hour]) bookingMap[b.date][b.hour] = [];
-    const courtLabel =
-      b.sport === SPORTS.BASKETBALL
-        ? `BB ${b.court}`
-        : b.sport === SPORTS.PICKLEBALL
-        ? `PB ${b.court}`
-        : b.court === 'Table Tennis'
-        ? 'TT'
-        : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`;
-    bookingMap[b.date][b.hour].push(`${courtLabel}\n${b.bookedBy.split(' ')[0]}`);
+    if (!bookingsByDate[b.date]) bookingsByDate[b.date] = [];
+
+    bookingsByDate[b.date].push({
+      sport: b.sport,
+      court: b.court,
+      start: b.start_hour * 60,
+      end: b.end_hour * 60,
+      bookedBy: b.bookedBy
+    });
   });
+
+  function overlaps(b, slotStart, slotEnd) {
+    return b.start < slotEnd && b.end > slotStart;
+  }
+
+  function getCourtLabel(b) {
+    if (b.court === 'Table Tennis') return 'TT';
+    if (b.court === 'FULL') return 'BB FULL';
+
+    return b.sport === SPORTS.BASKETBALL
+      ? `BB ${b.court}`
+      : b.sport === SPORTS.PICKLEBALL
+      ? `PB ${b.court}`
+      : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`;
+  }
 
   // Canvas dimensions
   const COL_WIDTH = 110;
@@ -408,64 +460,78 @@ async function sendCalendarImage(senderId, week) {
   ctx.fillStyle = '#1A237E';
   ctx.fillRect(0, 0, WIDTH, HEADER_HEIGHT);
 
-  // Header title
+  // Title
   ctx.fillStyle = '#FFFFFF';
   ctx.font = 'bold 15px sans-serif';
   ctx.textAlign = 'center';
   const weekLabel = `${week === 'this' ? 'This' : 'Next'} Week: ${formatDate(days[0])} – ${formatDate(days[6])}`;
   ctx.fillText(weekLabel, WIDTH / 2, 22);
 
-  // Day column headers
+  // Day headers
   const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   ctx.font = 'bold 12px sans-serif';
+
   days.forEach((d, i) => {
     const x = TIME_COL_WIDTH + COL_WIDTH * i + COL_WIDTH / 2;
+
     ctx.fillStyle = '#FFFFFF';
     ctx.fillText(DAY_NAMES[i], x, 42);
+
     ctx.font = '11px sans-serif';
     ctx.fillStyle = '#90CAF9';
     ctx.fillText(formatDate(d, true), x, 56);
+
     ctx.font = 'bold 12px sans-serif';
   });
 
-  // Grid rows
+  // -----------------------------
+  // Grid rendering
+  // -----------------------------
   BOOKING_HOURS.forEach((hour, rowIdx) => {
     const y = HEADER_HEIGHT + ROW_HEIGHT * rowIdx;
     const isEven = rowIdx % 2 === 0;
 
-    // Row background
     ctx.fillStyle = isEven ? '#FFFFFF' : '#F0F4FF';
     ctx.fillRect(TIME_COL_WIDTH, y, WIDTH - TIME_COL_WIDTH, ROW_HEIGHT);
 
-    // Time label
     ctx.fillStyle = '#37474F';
     ctx.font = 'bold 11px sans-serif';
     ctx.textAlign = 'right';
     ctx.fillText(formatHour(hour), TIME_COL_WIDTH - 6, y + ROW_HEIGHT / 2 + 4);
 
-    // Cells
+    const slotStart = hour * 60;
+    const slotEnd = (hour + 1) * 60;
+
     days.forEach((d, colIdx) => {
       const x = TIME_COL_WIDTH + COL_WIDTH * colIdx;
       const dateStr = dateStrings[colIdx];
-      const cellBookings = bookingMap[dateStr]?.[hour] || [];
 
-      // Cell border
+      const dayBookings = bookingsByDate[dateStr] || [];
+      const cellBookings = dayBookings.filter(b => overlaps(b, slotStart, slotEnd));
+
       ctx.strokeStyle = '#CFD8DC';
       ctx.lineWidth = 0.5;
       ctx.strokeRect(x, y, COL_WIDTH, ROW_HEIGHT);
 
-      // Booking chips
       if (cellBookings.length > 0) {
         const chipHeight = Math.min(ROW_HEIGHT - 6, (ROW_HEIGHT - 6) / cellBookings.length);
-        cellBookings.forEach((label, ci) => {
+
+        cellBookings.forEach((b, ci) => {
+          const isFirstCell = b.start >= slotStart && b.start < slotEnd;
+          if (!isFirstCell) return;
+
+          const label = `${getCourtLabel(b)}\n${b.bookedBy.split(' ')[0]}`;
+
           const chipY = y + 3 + chipHeight * ci;
+
           ctx.fillStyle = getChipColor(label);
           roundRect(ctx, x + 3, chipY, COL_WIDTH - 6, chipHeight - 2, 4);
+
           ctx.fillStyle = '#FFFFFF';
           ctx.font = `bold ${chipHeight > 20 ? 9 : 8}px sans-serif`;
           ctx.textAlign = 'center';
-          const lines = label.split('\n');
-          lines.forEach((line, li) => {
+
+          label.split('\n').forEach((line, li) => {
             ctx.fillText(line, x + COL_WIDTH / 2, chipY + 10 + li * 10, COL_WIDTH - 10);
           });
         });
@@ -476,6 +542,7 @@ async function sendCalendarImage(senderId, week) {
   // Row dividers
   ctx.strokeStyle = '#B0BEC5';
   ctx.lineWidth = 1;
+
   BOOKING_HOURS.forEach((_, rowIdx) => {
     const y = HEADER_HEIGHT + ROW_HEIGHT * rowIdx;
     ctx.beginPath();
@@ -484,7 +551,7 @@ async function sendCalendarImage(senderId, week) {
     ctx.stroke();
   });
 
-  // Time column right border
+  // Time column divider
   ctx.strokeStyle = '#90A4AE';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
@@ -496,15 +563,13 @@ async function sendCalendarImage(senderId, week) {
   ctx.fillStyle = '#37474F';
   ctx.font = '10px sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('BB=Basketball  PB=Pickleball  TT=Table Tennis', 6, HEIGHT - 4);
+  ctx.fillText('BB=Basketball  PB=Pickleball  TT=Table Tennis  FULL=All Courts A/B/C', 6, HEIGHT - 4);
 
-  // Save and upload
+  // Save + upload
   const tmpPath = path.join(os.tmpdir(), `calendar_${Date.now()}.png`);
   const buffer = canvas.toBuffer('image/png');
   fs.writeFileSync(tmpPath, buffer);
 
-  // Upload to temporary hosting via Imgur-style or just send as attachment
-  // Here we use a publicly accessible URL trick via Meta's attachment upload API
   const imageUrl = await uploadImageToMeta(tmpPath);
   fs.unlinkSync(tmpPath);
 
