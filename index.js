@@ -377,9 +377,14 @@ async function sendCalendarImage(senderId, week) {
     const b = doc.data();
     if (!bookingMap[b.date]) bookingMap[b.date] = {};
     if (!bookingMap[b.date][b.hour]) bookingMap[b.date][b.hour] = [];
-    const courtLabel = b.court === 'Table Tennis' ? 'TT' : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`
-    b.sport === SPORTS.BASKETBALL ? courtLabel = `BB ${b.court}` :
-    b.sport === SPORTS.PICKLEBALL ? courtLabel = `PB ${b.court}` : 'UNK';
+    const courtLabel =
+      b.sport === SPORTS.BASKETBALL
+        ? `BB ${b.court}`
+        : b.sport === SPORTS.PICKLEBALL
+        ? `PB ${b.court}`
+        : b.court === 'Table Tennis'
+        ? 'TT'
+        : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`;
     bookingMap[b.date][b.hour].push(`${courtLabel}\n${b.bookedBy.split(' ')[0]}`);
   });
 
