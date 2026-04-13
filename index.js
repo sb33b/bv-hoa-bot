@@ -23,7 +23,10 @@ const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 
 const firestore = new Firestore({
   projectId: serviceAccount.project_id,
-  credentials: serviceAccount,
+  credentials: {
+    client_email: serviceAccount.client_email,
+    private_key: serviceAccount.private_key,
+  },
 });
 
 const storage = new Storage({
