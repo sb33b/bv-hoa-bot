@@ -251,7 +251,7 @@ Format:
   "sport": "Basketball" | "Pickleball" | "Table Tennis" | null,
   "court": "A" | "B" | "C" | "Table Tennis" | null,
   "date": "YYYY-MM-DD" | null,
-  "hour": <integer 6-21, 24hr format> | null,
+  "hour": <integer 18-21, 24hr format> | null,
   "name": "<person's name>" | null,
   "unit": "###" | null
 }
@@ -374,7 +374,9 @@ async function sendCalendarImage(senderId, week) {
     const b = doc.data();
     if (!bookingMap[b.date]) bookingMap[b.date] = {};
     if (!bookingMap[b.date][b.hour]) bookingMap[b.date][b.hour] = [];
-    const courtLabel = b.court === 'Table Tennis' ? 'TT' : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`;
+    const courtLabel = b.court === 'Table Tennis' ? 'TT' : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`
+    b.sport === SPORTS.BASKETBALL ? courtLabel = `BB ${b.court}` :
+    b.sport === SPORTS.PICKLEBALL ? courtLabel = `PB ${b.court}` : 'UNK';
     bookingMap[b.date][b.hour].push(`${courtLabel}\n${b.bookedBy.split(' ')[0]}`);
   });
 
