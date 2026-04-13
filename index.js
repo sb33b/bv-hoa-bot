@@ -355,21 +355,6 @@ async function checkConflict(sport, court, date, start_hour, end_hour) {
   return hasConflict;
 }
 
-  const snapshot = await query.get();
-
-  // 🔥 Proper overlap check (done in memory)
-  const hasConflict = snapshot.docs.some(doc => {
-    const b = doc.data();
-
-    return (
-      b.start_minute < end_minute &&
-      b.end_minute > start_minute
-    );
-  });
-
-  return hasConflict;
-}
-
 async function sendCancelRedirect(senderId) {
   await sendTextWithButtons(senderId,
     'To cancel a booking, please message our admin directly. They will assist you shortly.',
