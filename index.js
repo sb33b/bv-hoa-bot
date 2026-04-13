@@ -289,7 +289,6 @@ Basketball and Pickleball use courts A, B, or C.`
   // Conflict check
   const hasConflict = await checkConflict(parsed.sport, parsed.court, parsed.date, parsed.start_hour, parsed.end_hour);
   if (hasConflict) {
-    const timeStr = formatHour(parsed.hour);
     await sendText(senderId,
       `❌ Sorry! ${parsed.sport} Court ${parsed.court} is already booked on ${parsed.date} at ${parsed.start_hour} to ${parsed.end_hour}.\n\nPlease choose a different time or court.`
     );
@@ -345,8 +344,8 @@ async function checkConflict(sport, court, date, start_hour, end_hour) {
     // -----------------------------
     // 2. FULL court rules
     // -----------------------------
-    const newIsFull = court === 'FULL';
-    const existingIsFull = b.court === 'FULL';
+    const newIsFull = court === 'Full';
+    const existingIsFull = b.court === 'Full';
 
     if (newIsFull || existingIsFull) {
       // FULL blocks ANY A/B/C and vice versa
