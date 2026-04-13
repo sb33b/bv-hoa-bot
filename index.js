@@ -369,11 +369,15 @@ async function sendCancelRedirect(senderId) {
 async function sendCalendarImage(senderId, week) {
   await sendText(senderId, `Generating ${week === 'this' ? "this" : "next"} week's calendar...`);
 
-  // Calculate Mon–Sun of target week
+  // -----------------------------
+  // Build week range (Mon–Sun)
+  // -----------------------------
   const today = new Date();
-  const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon...
+  const dayOfWeek = today.getDay();
+
   const monday = new Date(today);
   monday.setDate(today.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+
   if (week === 'next') monday.setDate(monday.getDate() + 7);
 
   const days = Array.from({ length: 7 }, (_, i) => {
@@ -383,22 +387,26 @@ async function sendCalendarImage(senderId, week) {
   });
 
   const dateStrings = days.map(d => d.toISOString().split('T')[0]);
+
   const startDate = dateStrings[0];
   const endDate = dateStrings[6];
 
-  // Fetch bookings for the week
+  // -----------------------------
+  // Fetch bookings
+  // -----------------------------
   const snapshot = await firestore.collection('bookings')
     .where('date', '>=', startDate)
     .where('date', '<=', endDate)
     .get();
 
   // -----------------------------
-  // Normalize bookings (interval model)
+  // Normalize bookings
   // -----------------------------
   const bookingsByDate = {};
 
   snapshot.forEach(doc => {
     const b = doc.data();
+
     if (!bookingsByDate[b.date]) bookingsByDate[b.date] = [];
 
     bookingsByDate[b.date].push({
@@ -425,14 +433,16 @@ async function sendCalendarImage(senderId, week) {
       : `${b.sport.substring(0, 2).toUpperCase()} ${b.court}`;
   }
 
-  // Canvas dimensions
+  // -----------------------------
+  // Canvas setup
+  // -----------------------------
   const COL_WIDTH = 110;
   const ROW_HEIGHT = 52;
   const HEADER_HEIGHT = 60;
   const TIME_COL_WIDTH = 64;
-  const NUM_ROWS = BOOKING_HOURS.length;
+
   const WIDTH = TIME_COL_WIDTH + COL_WIDTH * 7;
-  const HEIGHT = HEADER_HEIGHT + ROW_HEIGHT * NUM_ROWS;
+  const HEIGHT = HEADER_HEIGHT + ROW_HEIGHT * BOOKING_HOURS.length;
 
   const canvas = createCanvas(WIDTH, HEIGHT);
   const ctx = canvas.getContext('2d');
@@ -441,19 +451,24 @@ async function sendCalendarImage(senderId, week) {
   ctx.fillStyle = '#F8F9FA';
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-  // Header background
+  // Header
   ctx.fillStyle = '#1A237E';
   ctx.fillRect(0, 0, WIDTH, HEADER_HEIGHT);
 
-  // Title
   ctx.fillStyle = '#FFFFFF';
   ctx.font = 'bold 15px sans-serif';
   ctx.textAlign = 'center';
-  const weekLabel = `${week === 'this' ? 'This' : 'Next'} Week: ${formatDate(days[0])} – ${formatDate(days[6])}`;
+
+  const weekLabel =
+    `${week === 'this' ? 'This' : 'Next'} Week: ${formatDate(days[0])} – ${formatDate(days[6])}`;
+
   ctx.fillText(weekLabel, WIDTH / 2, 22);
 
+  // -----------------------------
   // Day headers
+  // -----------------------------
   const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
   ctx.font = 'bold 12px sans-serif';
 
   days.forEach((d, i) => {
@@ -470,7 +485,7 @@ async function sendCalendarImage(senderId, week) {
   });
 
   // -----------------------------
-  // Grid rendering
+  // GRID RENDERING
   // -----------------------------
   BOOKING_HOURS.forEach((hour, rowIdx) => {
     const y = HEADER_HEIGHT + ROW_HEIGHT * rowIdx;
@@ -479,6 +494,7 @@ async function sendCalendarImage(senderId, week) {
     ctx.fillStyle = isEven ? '#FFFFFF' : '#F0F4FF';
     ctx.fillRect(TIME_COL_WIDTH, y, WIDTH - TIME_COL_WIDTH, ROW_HEIGHT);
 
+    // Time label
     ctx.fillStyle = '#37474F';
     ctx.font = 'bold 11px sans-serif';
     ctx.textAlign = 'right';
@@ -487,44 +503,63 @@ async function sendCalendarImage(senderId, week) {
     const slotStart = hour * 60;
     const slotEnd = (hour + 1) * 60;
 
+    // -----------------------------
+    // Render each day column
+    // -----------------------------
     days.forEach((d, colIdx) => {
       const x = TIME_COL_WIDTH + COL_WIDTH * colIdx;
       const dateStr = dateStrings[colIdx];
 
       const dayBookings = bookingsByDate[dateStr] || [];
-      const cellBookings = dayBookings.filter(b => overlaps(b, slotStart, slotEnd));
 
+      // Cell border
       ctx.strokeStyle = '#CFD8DC';
       ctx.lineWidth = 0.5;
       ctx.strokeRect(x, y, COL_WIDTH, ROW_HEIGHT);
 
-      if (cellBookings.length > 0) {
-        const chipHeight = Math.min(ROW_HEIGHT - 6, (ROW_HEIGHT - 6) / cellBookings.length);
+      dayBookings.forEach(b => {
+        if (!overlaps(b, slotStart, slotEnd)) return;
 
-        cellBookings.forEach((b, ci) => {
-          const isFirstCell = b.start >= slotStart && b.start < slotEnd;
-          if (!isFirstCell) return;
+        // Visible portion of booking inside this cell
+        const visibleStart = Math.max(b.start, slotStart);
+        const visibleEnd = Math.min(b.end, slotEnd);
 
-          const label = `${getCourtLabel(b)}\n${b.bookedBy.split(' ')[0]}`;
+        const ratioStart = (visibleStart - slotStart) / 60;
+        const ratioEnd = (visibleEnd - slotStart) / 60;
 
-          const chipY = y + 3 + chipHeight * ci;
+        const blockY = y + ratioStart * ROW_HEIGHT;
+        const blockHeight = Math.max(2, (ratioEnd - ratioStart) * ROW_HEIGHT);
 
-          ctx.fillStyle = getChipColor(label);
-          roundRect(ctx, x + 3, chipY, COL_WIDTH - 6, chipHeight - 2, 4);
+        // FULL court spans 3 columns
+        let blockWidth = COL_WIDTH;
+        if (b.court === 'FULL') {
+          blockWidth = COL_WIDTH * 3;
+        }
 
-          ctx.fillStyle = '#FFFFFF';
-          ctx.font = `bold ${chipHeight > 20 ? 9 : 8}px sans-serif`;
-          ctx.textAlign = 'center';
+        const label = `${getCourtLabel(b)}\n${b.bookedBy.split(' ')[0]}`;
 
-          label.split('\n').forEach((line, li) => {
-            ctx.fillText(line, x + COL_WIDTH / 2, chipY + 10 + li * 10, COL_WIDTH - 10);
-          });
+        ctx.fillStyle = getChipColor(label);
+        roundRect(ctx, x + 3, blockY + 2, blockWidth - 6, blockHeight - 4, 4);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = `bold ${blockHeight > 18 ? 9 : 8}px sans-serif`;
+        ctx.textAlign = 'center';
+
+        label.split('\n').forEach((line, li) => {
+          ctx.fillText(
+            line,
+            x + blockWidth / 2,
+            blockY + 12 + li * 10,
+            blockWidth - 10
+          );
         });
-      }
+      });
     });
   });
 
-  // Row dividers
+  // -----------------------------
+  // Grid lines
+  // -----------------------------
   ctx.strokeStyle = '#B0BEC5';
   ctx.lineWidth = 1;
 
@@ -536,9 +571,9 @@ async function sendCalendarImage(senderId, week) {
     ctx.stroke();
   });
 
-  // Time column divider
   ctx.strokeStyle = '#90A4AE';
   ctx.lineWidth = 1.5;
+
   ctx.beginPath();
   ctx.moveTo(TIME_COL_WIDTH, 0);
   ctx.lineTo(TIME_COL_WIDTH, HEIGHT);
@@ -548,11 +583,18 @@ async function sendCalendarImage(senderId, week) {
   ctx.fillStyle = '#37474F';
   ctx.font = '10px sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('BB=Basketball  PB=Pickleball  TT=Table Tennis  FULL=All Courts A/B/C', 6, HEIGHT - 4);
+  ctx.fillText(
+    'BB=Basketball  PB=Pickleball  TT=Table Tennis  FULL=All Courts A/B/C',
+    6,
+    HEIGHT - 4
+  );
 
-  // Save + upload
+  // -----------------------------
+  // Export
+  // -----------------------------
   const tmpPath = path.join(os.tmpdir(), `calendar_${Date.now()}.png`);
   const buffer = canvas.toBuffer('image/png');
+
   fs.writeFileSync(tmpPath, buffer);
 
   const imageUrl = await uploadImageToMeta(tmpPath);
