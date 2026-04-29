@@ -102,7 +102,7 @@ app.post('/webhook', async (req, res) => {
         }
       } catch (err) {
         console.error('Handler error:', err);
-        await sendText(senderId, 'Something went wrong. Please try again.');
+        await sendText(senderId, '❌ Something went wrong. Please try again.');
       }
     }
     res.status(200).send('EVENT_RECEIVED');
@@ -164,7 +164,7 @@ async function handleMessage(senderId, message) {
   if (session?.step === 'RECEIPT_AWAIT_IMAGE') {
     const attachment = message.attachments?.[0];
     if (!attachment || attachment.type !== 'image') {
-      await sendText(senderId, 'Please send an image file of your receipt.');
+      await sendText(senderId, '⚠️ Please send an image file of your receipt.');
       return;
     }
     sessions[senderId].data.imageUrl = attachment.payload.url;
@@ -232,7 +232,19 @@ async function showCourtBookingsMenu(senderId) {
 async function startBookingFlow(senderId) {
   sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
   await sendText(senderId,
-    'Please describe your booking in one message.\n\nExample:\n"Pickleball Court A, April 16, 7pm to 8pm, Unit 716, Juan dela Cruz"\n\nAvailable courts:\n• Basketball — Court A, B, C\n• Pickleball — Court A, B, C\n• Table Tennis'
+    'Please describe your booking in one message with the following details:\n\n' +
+    '- Facility type (e.g., Basketball, Pickleball, Table Tennis)\n' +
+    '- Court (if applicable, e.g., Court A, B, C)\n' +
+    '- Date\n' +
+    '- Time (start–end)\n' +
+    '- Unit / Resident\n' +
+    '- Name\n\n' +
+    'Example:\n' +
+    '"Pickleball Court A, April 16, 7:00–8:00 PM, Unit 716, Juan Dela Cruz"\n\n' +
+    'Available courts:\n' +
+    '• Basketball — Court 1, 2, Full\n' +
+    '• Pickleball — Court A, B, C\n' +
+    '• Table Tennis'
   );
 }
 
@@ -267,7 +279,8 @@ Always return this format:
 If the user only mentions one booking, still return a single-element "bookings" array.
 Today's date is ${new Date().toISOString().split('T')[0]}.
 For Table Tennis there is only one court — set court to "Table Tennis".
-Basketball and Pickleball use courts A, B, or C.`
+Basketball courts are "1", "2", or "Full".
+Pickleball courts are "A", "B", or "C".`
         },
         { role: 'user', content: userMessage }
       ]
@@ -276,7 +289,7 @@ Basketball and Pickleball use courts A, B, or C.`
     parsed = JSON.parse(raw);
   } catch (err) {
     console.error('OpenAI parse error:', err);
-    await sendText(senderId, "I couldn't understand that booking. Please try again.\n\nExample: \"Basketball Court A, April 16, 7pm, Juan dela Cruz\"");
+    await sendText(senderId, "❌ I couldn't understand that booking. Please try again.\n\nExample: \"Basketball Court A, April 16, 7pm, Juan dela Cruz\"");
     return;
   }
 
@@ -288,7 +301,7 @@ Basketball and Pickleball use courts A, B, or C.`
 
   if (!bookings.length) {
     await sendText(senderId,
-      `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Start Time (e.g. 7pm)\n• Your name\n• Your unit number`
+      `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`
     );
     sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
     return;
@@ -318,6 +331,17 @@ Basketball and Pickleball use courts A, B, or C.`
       continue;
     }
 
+    // Validate sport/court compatibility after OpenAI parsing
+    const isValidSportCourt =
+      (b.sport === 'Basketball' && (b.court === '1' || b.court === '2' || b.court === 'Full')) ||
+      (b.sport === 'Pickleball' && (b.court === 'A' || b.court === 'B' || b.court === 'C')) ||
+      (b.sport === 'Table Tennis' && b.court === 'Table Tennis');
+
+    if (!isValidSportCourt) {
+      failed.push({ booking: b, reason: 'missing_details' });
+      continue;
+    }
+
     // Conflict check for each booking
     const hasConflict = await checkConflict(b.sport, b.court, b.date, b.start_hour, b.end_hour);
     if (hasConflict) {
@@ -343,7 +367,7 @@ Basketball and Pickleball use courts A, B, or C.`
 
   if (!confirmed.length && !failed.length) {
     await sendText(senderId,
-      `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Start Time (e.g. 7pm)\n• Your name\n• Your unit number`
+      `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`
     );
     sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
     return;
@@ -379,7 +403,7 @@ Basketball and Pickleball use courts A, B, or C.`
   const missingDetails = failed.filter(f => f.reason === 'missing_details');
   if (missingDetails.length) {
     lines.push(
-      '⚠️ I could not process these bookings because some details were missing. Please resend them with sport, court, date, time, unit, and your name:'
+      `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`
     );
     missingDetails.forEach(({ booking: b }) => {
       lines.push(
@@ -749,7 +773,7 @@ async function finalizeReceipt(senderId, purpose) {
     base64Image = Buffer.from(response.data).toString('base64');
   } catch (err) {
     console.error('Image download error:', err);
-    await sendText(senderId, 'Failed to download your image. Please try again.');
+    await sendText(senderId, '❌ Failed to download your image. Please try again.');
     return;
   }
 
