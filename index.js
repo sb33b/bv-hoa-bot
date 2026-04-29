@@ -249,16 +249,22 @@ async function processBookingRequest(senderId, userMessage) {
           role: 'system',
           content: `You are a court booking assistant for a village HOA. 
 Extract booking details from the user's message and return ONLY a valid JSON object with no markdown or extra text.
-Format:
+The user may request ONE or MULTIPLE bookings in a single message.
+Always return this format:
 {
-  "sport": "Basketball" | "Pickleball" | "Table Tennis" | null,
-  "court": "A" | "B" | "C" | "Table Tennis" | "Full" | null,
-  "date": "YYYY-MM-DD" | null,
-  "start_hour": <integer 18-21, 24hr format> | null,
-  "end_hour": <integer 19-22, 24hr format> | null,
-  "name": "<person's name>" | null,
-  "unit": "###" | null
+  "bookings": [
+    {
+      "sport": "Basketball" | "Pickleball" | "Table Tennis" | null,
+      "court": "A" | "B" | "C" | "1" | "2" | "Table Tennis" | "Full" | null,
+      "date": "YYYY-MM-DD" | null,
+      "start_hour": <integer 18-21, 24hr format> | null,
+      "end_hour": <integer 19-22, 24hr format> | null,
+      "name": "<person's name>" | null,
+      "unit": "###" | null
+    }
+  ]
 }
+If the user only mentions one booking, still return a single-element "bookings" array.
 Today's date is ${new Date().toISOString().split('T')[0]}.
 For Table Tennis there is only one court — set court to "Table Tennis".
 Basketball and Pickleball use courts A, B, or C.`
@@ -274,45 +280,120 @@ Basketball and Pickleball use courts A, B, or C.`
     return;
   }
 
-  // Validate required fields
-  if (!parsed.sport || !parsed.court || !parsed.date || parsed.start_hour === null || !parsed.name || !parsed.unit) {
+  const bookings = Array.isArray(parsed?.bookings)
+    ? parsed.bookings
+    : parsed
+    ? [parsed]
+    : [];
+
+  if (!bookings.length) {
     await sendText(senderId,
       `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Start Time (e.g. 7pm)\n• Your name\n• Your unit number`
-    );
-    return;
-  }
-
-  if(parsed.end_hour === null) {
-    parsed.end_hour = parsed.start_hour + 1; // Default to 1 hour booking if end time not provided
-  }
-
-  // Conflict check
-  const hasConflict = await checkConflict(parsed.sport, parsed.court, parsed.date, parsed.start_hour, parsed.end_hour);
-  if (hasConflict) {
-    await sendText(senderId,
-      `❌ Sorry! ${parsed.sport} Court ${parsed.court} is already booked on ${parsed.date} at ${parsed.start_hour} to ${parsed.end_hour}.\n\nPlease choose a different time or court.`
     );
     sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
     return;
   }
 
-  // Write to Firestore
-  await firestore.collection('bookings').add({
-    sport: parsed.sport,
-    court: parsed.court,
-    date: parsed.date,
-    start_hour: parsed.start_hour,
-    end_hour: parsed.end_hour,
-    unit: parsed.unit,
-    bookedBy: parsed.name,
-    messengerUserId: senderId,
-    createdAt: Firestore.Timestamp.now(),
-  });
+  // If any booking is missing a name, try to fetch it from the user's profile
+  if (bookings.some(b => !b.name)) {
+    const profileName = await getUserProfileName(senderId);
+    if (profileName) {
+      bookings.forEach(b => {
+        if (!b.name) b.name = profileName;
+      });
+    }
+  }
 
-  await sendText(senderId,
-    `✅ Booking confirmed!\n\n🏟️ ${parsed.sport} — Court ${parsed.court}\n📅 ${parsed.date}\n🕐 ${formatHour(parsed.start_hour)}–${formatHour(parsed.end_hour)}\n👤 ${parsed.name}\n\nEnjoy your game! 🎉`
-  );
-  sessions[senderId] = null;
+  const confirmed = [];
+  const failed = [];
+
+  for (const b of bookings) {
+    if (b.end_hour === null || b.end_hour === undefined) {
+      b.end_hour = b.start_hour != null ? b.start_hour + 1 : null; // Default to 1 hour booking if end time not provided
+    }
+
+    // Validate required fields per booking
+    if (!b.sport || !b.court || !b.date || b.start_hour === null || b.start_hour === undefined || !b.unit || !b.name) {
+      failed.push({ booking: b, reason: 'missing_details' });
+      continue;
+    }
+
+    // Conflict check for each booking
+    const hasConflict = await checkConflict(b.sport, b.court, b.date, b.start_hour, b.end_hour);
+    if (hasConflict) {
+      failed.push({ booking: b, reason: 'conflict' });
+      continue;
+    }
+
+    // Write non-conflicting booking to Firestore
+    await firestore.collection('bookings').add({
+      sport: b.sport,
+      court: b.court,
+      date: b.date,
+      start_hour: b.start_hour,
+      end_hour: b.end_hour,
+      unit: b.unit,
+      bookedBy: b.name,
+      messengerUserId: senderId,
+      createdAt: Firestore.Timestamp.now(),
+    });
+
+    confirmed.push(b);
+  }
+
+  if (!confirmed.length && !failed.length) {
+    await sendText(senderId,
+      `I'm missing some details. Please include:\n• Sport (Basketball, Pickleball, or Table Tennis)\n• Court (A, B, or C — not needed for Table Tennis)\n• Date\n• Start Time (e.g. 7pm)\n• Your name\n• Your unit number`
+    );
+    sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
+    return;
+  }
+
+  const lines = [];
+
+  if (confirmed.length) {
+    lines.push('✅ The following bookings are confirmed:');
+    confirmed.forEach(b => {
+      lines.push(
+        `• ${b.sport} — Court ${b.court} on ${b.date}, ${formatHour(b.start_hour)}–${formatHour(
+          b.end_hour
+        )} (Unit ${b.unit}, ${b.name})`
+      );
+    });
+    lines.push(''); // blank line between sections
+  }
+
+  const conflicts = failed.filter(f => f.reason === 'conflict');
+  if (conflicts.length) {
+    lines.push('❌ These bookings could not be made due to conflicts with existing bookings:');
+    conflicts.forEach(({ booking: b }) => {
+      lines.push(
+        `• ${b.sport} — Court ${b.court} on ${b.date}, ${formatHour(b.start_hour)}–${formatHour(
+          b.end_hour
+        )} (Unit ${b.unit || 'N/A'}, ${b.name || 'N/A'})`
+      );
+    });
+    lines.push('');
+  }
+
+  const missingDetails = failed.filter(f => f.reason === 'missing_details');
+  if (missingDetails.length) {
+    lines.push(
+      '⚠️ I could not process these bookings because some details were missing. Please resend them with sport, court, date, time, unit, and your name:'
+    );
+    missingDetails.forEach(({ booking: b }) => {
+      lines.push(
+        `• ${b.sport || 'Sport?'} — Court ${b.court || 'Court?'} on ${b.date || 'Date?'}${
+          b.start_hour != null ? `, ${formatHour(b.start_hour)}` : ''
+        } (Unit ${b.unit || 'Unit?'}, ${b.name || 'Name?'})`
+      );
+    });
+  }
+
+  const summary = lines.join('\n');
+
+  await sendText(senderId, summary);
+  sessions[senderId] = confirmed.length ? null : { step: 'BOOKING_AWAIT_DETAILS', data: {} };
 }
 
 async function checkConflict(sport, court, date, start_hour, end_hour) {
@@ -823,6 +904,26 @@ async function sendTextWithButtons(recipientId, text, buttons) {
         },
       },
     });
+  }
+}
+
+async function getUserProfileName(senderId) {
+  try {
+    const response = await axios.get(`https://graph.facebook.com/v19.0/${senderId}`, {
+      params: {
+        access_token: PAGE_ACCESS_TOKEN,
+        fields: 'name,first_name,last_name',
+      },
+    });
+    const data = response.data || {};
+    const fullName =
+      data.name ||
+      [data.first_name, data.last_name].filter(Boolean).join(' ').trim() ||
+      null;
+    return fullName || null;
+  } catch (err) {
+    console.error('Failed to fetch user profile name:', err?.response?.data || err.message || err);
+    return null;
   }
 }
 
