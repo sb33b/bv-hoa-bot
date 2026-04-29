@@ -9,6 +9,7 @@ const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { DateTime } = require('luxon');
 
 const app = express();
 app.use(express.json());
@@ -43,6 +44,7 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const ADMIN_MESSENGER_ID = process.env.ADMIN_MESSENGER_ID;
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const QUEUE_TASK_TOKEN = process.env.QUEUE_TASK_TOKEN;
 
 // ─────────────────────────────────────────────
 // CONSTANTS
@@ -65,6 +67,170 @@ const BOOKING_HOURS = Array.from({ length: 4 }, (_, i) => i + 18); // [18,19,20,
 const sessions = {};
 
 const bucketName = 'bv-hoa-bucket';
+
+// ─────────────────────────────────────────────
+// BOOKING QUEUE (Sunday 10AM PH time)
+// ─────────────────────────────────────────────
+
+const QUEUE_TZ = 'Asia/Manila';
+const QUEUE_JOIN_WINDOW_MINUTES = 2; // users who message within this window are queued
+const QUEUE_TURN_GRACE_MINUTES = 3; // time to send updated booking during their turn
+const QUEUE_NOTIFY_MOVE_BY = 5; // notify every time user moves up by 5 places
+
+function getCurrentQueueWindow(now = DateTime.now()) {
+  const dt = now.setZone(QUEUE_TZ);
+
+  // Luxon weekday: 1=Mon ... 7=Sun
+  const daysSinceSunday = dt.weekday % 7; // Sunday -> 0
+  let sunday = dt.minus({ days: daysSinceSunday }).startOf('day');
+  let windowStart = sunday.set({ hour: 10, minute: 0, second: 0, millisecond: 0 });
+
+  // If it's before Sunday 10:00 AM, use previous week's window
+  if (dt < windowStart) {
+    windowStart = windowStart.minus({ days: 7 });
+  }
+
+  const windowEnd = windowStart.plus({ minutes: QUEUE_JOIN_WINDOW_MINUTES });
+  const windowId = windowStart.toFormat("yyyyLLdd'T'HHmm"); // stable Firestore-safe id
+
+  const isJoinWindow = dt >= windowStart && dt < windowEnd;
+  const hasOpened = dt >= windowStart;
+
+  return {
+    windowId,
+    windowStart,
+    windowEnd,
+    isJoinWindow,
+    hasOpened,
+  };
+}
+
+function tsFromDateTime(dt) {
+  return Firestore.Timestamp.fromDate(dt.toJSDate());
+}
+
+function nowTs() {
+  return Firestore.Timestamp.now();
+}
+
+async function getQueueEntryRef(windowId, senderId) {
+  const entryId = `${windowId}_${senderId}`;
+  return firestore.collection('queueEntries').doc(entryId);
+}
+
+async function getQueuePosition(windowId, entryId) {
+  const snapshot = await firestore
+    .collection('queueEntries')
+    .where('windowId', '==', windowId)
+    .orderBy('createdAt')
+    .get();
+
+  const activeStatuses = new Set(['queued', 'active', 'waiting_new_booking']);
+  const active = snapshot.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(e => activeStatuses.has(e.status));
+
+  const idx = active.findIndex(e => e.id === entryId);
+  return idx === -1 ? null : idx + 1;
+}
+
+async function ensureQueueEntry(window, senderId, bookingMessage) {
+  const entryRef = await getQueueEntryRef(window.windowId, senderId);
+  const entryId = entryRef.id;
+
+  await firestore.runTransaction(async tx => {
+    const existing = await tx.get(entryRef);
+    if (!existing.exists) {
+      tx.set(entryRef, {
+        windowId: window.windowId,
+        senderId,
+        createdAt: nowTs(),
+        status: 'queued',
+        pendingBookingMessage: bookingMessage || null,
+        pendingBookingUpdatedAt: bookingMessage ? nowTs() : null,
+        lastUserMessageAt: bookingMessage ? nowTs() : null,
+        lastProcessedBookingUpdatedAt: null,
+        lastNotifiedPosition: null,
+        turnStartedAt: null,
+        turnExpiresAt: null,
+        result: { confirmed: [], conflicts: [], invalid: [] },
+      });
+      return;
+    }
+
+    const data = existing.data() || {};
+    // Only allow updates if entry is still relevant
+    if (['queued', 'active', 'waiting_new_booking'].includes(data.status)) {
+      tx.update(entryRef, {
+        pendingBookingMessage: bookingMessage || data.pendingBookingMessage || null,
+        pendingBookingUpdatedAt: bookingMessage ? nowTs() : data.pendingBookingUpdatedAt || null,
+        lastUserMessageAt: bookingMessage ? nowTs() : data.lastUserMessageAt || null,
+      });
+    }
+  });
+
+  return { entryRef, entryId };
+}
+
+async function updateQueueStateLease(tx, stateRef, ownerId, leaseSeconds = 30) {
+  const now = DateTime.utc();
+  const leaseExpiresAt = tsFromDateTime(now.plus({ seconds: leaseSeconds }));
+
+  const snap = await tx.get(stateRef);
+  const state = snap.exists ? snap.data() : {};
+
+  if (state?.leaseExpiresAt && state.leaseExpiresAt.toDate() > new Date()) {
+    return { acquired: false, state };
+  }
+
+  tx.set(
+    stateRef,
+    {
+      leaseOwner: ownerId,
+      leaseExpiresAt,
+      updatedAt: nowTs(),
+    },
+    { merge: true }
+  );
+
+  return { acquired: true, state };
+}
+
+async function handleBookingMessage(senderId, userMessage) {
+  const text = userMessage?.trim();
+  const window = getCurrentQueueWindow();
+
+  // Look up existing queue entry for current window (if any)
+  const entryRef = await getQueueEntryRef(window.windowId, senderId);
+  const entrySnap = await entryRef.get();
+  const hasActiveQueueEntry =
+    entrySnap.exists && ['queued', 'active', 'waiting_new_booking'].includes(entrySnap.data()?.status);
+
+  if (window.isJoinWindow) {
+    const { entryId } = await ensureQueueEntry(window, senderId, text);
+    const position = await getQueuePosition(window.windowId, entryId);
+
+    await sendText(
+      senderId,
+      `✅ You’re in the queue for this week’s booking release.${position ? ` You are #${position}.` : ''}\n\n⚠️ You can send booking details anytime. I’ll process your latest message when it’s your turn.`
+    );
+    return;
+  }
+
+  if (hasActiveQueueEntry) {
+    const { entryId } = await ensureQueueEntry(window, senderId, text);
+    const position = await getQueuePosition(window.windowId, entryId);
+
+    await sendText(
+      senderId,
+      `⚠️ You’re currently in the queue${position ? ` (#${position})` : ''}. I saved your latest booking request and will process it when it’s your turn.`
+    );
+    return;
+  }
+
+  // Not in join window and not already queued → process immediately
+  await processBookingRequest(senderId, text);
+}
 
 // ─────────────────────────────────────────────
 // WEBHOOK VERIFICATION
@@ -183,7 +349,7 @@ async function handleMessage(senderId, message) {
 
   // ── Booking flow ──
   if (session?.step === 'BOOKING_AWAIT_DETAILS') {
-    await processBookingRequest(senderId, message.text?.trim());
+    await handleBookingMessage(senderId, message.text?.trim());
     return;
   }
 
@@ -293,6 +459,10 @@ Pickleball courts are "A", "B", or "C".`
     return;
   }
 
+  return await processParsedBookings(senderId, parsed, { sendSummary: true });
+}
+
+async function processParsedBookings(senderId, parsed, { sendSummary }) {
   const bookings = Array.isArray(parsed?.bookings)
     ? parsed.bookings
     : parsed
@@ -300,11 +470,16 @@ Pickleball courts are "A", "B", or "C".`
     : [];
 
   if (!bookings.length) {
-    await sendText(senderId,
-      `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`
-    );
-    sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
-    return;
+    if (sendSummary) {
+      await sendText(senderId, `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`);
+      sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
+    }
+    return {
+      confirmed: [],
+      conflicts: [],
+      invalid: [{ booking: {}, reason: 'missing_details' }],
+      summaryText: `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`,
+    };
   }
 
   // If any booking is missing a name, try to fetch it from the user's profile
@@ -366,11 +541,16 @@ Pickleball courts are "A", "B", or "C".`
   }
 
   if (!confirmed.length && !failed.length) {
-    await sendText(senderId,
-      `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`
-    );
-    sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
-    return;
+    if (sendSummary) {
+      await sendText(senderId, `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`);
+      sessions[senderId] = { step: 'BOOKING_AWAIT_DETAILS', data: {} };
+    }
+    return {
+      confirmed: [],
+      conflicts: [],
+      invalid: [{ booking: {}, reason: 'missing_details' }],
+      summaryText: `⚠️ I'm missing some details. Please try again and ensure all details are provided and valid.`,
+    };
   }
 
   const lines = [];
@@ -416,8 +596,69 @@ Pickleball courts are "A", "B", or "C".`
 
   const summary = lines.join('\n');
 
-  await sendText(senderId, summary);
-  sessions[senderId] = confirmed.length ? null : { step: 'BOOKING_AWAIT_DETAILS', data: {} };
+  if (sendSummary) {
+    await sendText(senderId, summary);
+    sessions[senderId] = confirmed.length ? null : { step: 'BOOKING_AWAIT_DETAILS', data: {} };
+  }
+
+  return {
+    confirmed,
+    conflicts: failed.filter(f => f.reason === 'conflict').map(f => f.booking),
+    invalid: failed.filter(f => f.reason === 'missing_details').map(f => f.booking),
+    summaryText: summary,
+  };
+}
+
+async function processBookingRequestSilently(senderId, userMessage) {
+  // Used by queue dispatcher when it is the user's turn.
+  // Returns structured results and does not touch session state.
+  let parsed;
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-5-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a court booking assistant for a village HOA. 
+Extract booking details from the user's message and return ONLY a valid JSON object with no markdown or extra text.
+The user may request ONE or MULTIPLE bookings in a single message.
+Always return this format:
+{
+  "bookings": [
+    {
+      "sport": "Basketball" | "Pickleball" | "Table Tennis" | null,
+      "court": "A" | "B" | "C" | "1" | "2" | "Table Tennis" | "Full" | null,
+      "date": "YYYY-MM-DD" | null,
+      "start_hour": <integer 18-21, 24hr format> | null,
+      "end_hour": <integer 19-22, 24hr format> | null,
+      "name": "<person's name>" | null,
+      "unit": "###" | null
+    }
+  ]
+}
+If the user only mentions one booking, still return a single-element "bookings" array.
+Today's date is ${new Date().toISOString().split('T')[0]}.
+For Table Tennis there is only one court — set court to "Table Tennis".
+Basketball courts are "1", "2", or "Full".
+Pickleball courts are "A", "B", or "C".`
+        },
+        { role: 'user', content: userMessage }
+      ]
+    });
+    const raw = response.choices[0].message.content.trim();
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.error('OpenAI parse error (silent):', err);
+    return {
+      confirmed: [],
+      conflicts: [],
+      invalid: [{ booking: {}, reason: 'parse_error' }],
+      summaryText:
+        `❌ I couldn't understand that booking. Please try again.\n\nExample: "Basketball Court 1, April 16, 7pm, Unit 716, Juan dela Cruz"`,
+    };
+  }
+
+  return await processParsedBookings(senderId, parsed, { sendSummary: false });
 }
 
 async function checkConflict(sport, court, date, start_hour, end_hour) {
@@ -462,6 +703,235 @@ async function checkConflict(sport, court, date, start_hour, end_hour) {
     // -----------------------------
     return b.court === court;
   });
+}
+
+app.post('/tasks/dispatch-queue', async (req, res) => {
+  try {
+    const token = req.headers['x-queue-token'];
+    if (!QUEUE_TASK_TOKEN || token !== QUEUE_TASK_TOKEN) {
+      return res.status(403).send('Forbidden');
+    }
+
+    await dispatchBookingQueue();
+    return res.status(200).send('OK');
+  } catch (err) {
+    console.error('dispatch-queue error:', err);
+    return res.status(500).send('Error');
+  }
+});
+
+async function dispatchBookingQueue() {
+  // Guard: only run dispatcher on Sundays 9:50–10:30 AM Philippine time.
+  // This keeps Cloud Run invocations cheap outside the queue rush window.
+  const dt = DateTime.now().setZone(QUEUE_TZ);
+  const isSunday = dt.weekday === 7; // Luxon: 7 = Sunday
+  const minutesSinceMidnight = dt.hour * 60 + dt.minute;
+  const start = 9 * 60 + 50; // 09:50
+  const end = 10 * 60 + 30; // 10:30
+  const inRushWindow = minutesSinceMidnight >= start && minutesSinceMidnight <= end;
+  if (!isSunday || !inRushWindow) return;
+
+  const window = getCurrentQueueWindow();
+  const windowId = window.windowId;
+
+  // Acquire lease on queue state so only one dispatcher runs
+  const stateRef = firestore.collection('queueState').doc('bookingQueue');
+  const ownerId = `dispatcher_${process.pid}`;
+
+  const leaseResult = await firestore.runTransaction(async tx => {
+    const { acquired, state } = await updateQueueStateLease(tx, stateRef, ownerId, 30);
+    if (!acquired) return { acquired: false, state };
+
+    // Ensure state doc has window info
+    tx.set(
+      stateRef,
+      {
+        windowId,
+        windowStartAt: tsFromDateTime(window.windowStart),
+        windowEndAt: tsFromDateTime(window.windowEnd),
+        isOpen: window.isJoinWindow,
+        updatedAt: nowTs(),
+      },
+      { merge: true }
+    );
+    return { acquired: true, state };
+  });
+
+  if (!leaseResult.acquired) return;
+
+  // Notify position improvements (every +5)
+  await notifyQueueMovements(windowId);
+
+  const stateSnap = await stateRef.get();
+  const state = stateSnap.exists ? stateSnap.data() : {};
+  const activeEntryId = state?.activeEntryId || null;
+
+  if (activeEntryId) {
+    await handleActiveTurn(windowId, stateRef, activeEntryId);
+    return;
+  }
+
+  // Activate next queued entry
+  const nextSnap = await firestore
+    .collection('queueEntries')
+    .where('windowId', '==', windowId)
+    .where('status', '==', 'queued')
+    .orderBy('createdAt')
+    .limit(1)
+    .get();
+
+  if (nextSnap.empty) return;
+
+  const nextDoc = nextSnap.docs[0];
+  const nextEntryId = nextDoc.id;
+
+  await firestore.runTransaction(async tx => {
+    const entry = await tx.get(nextDoc.ref);
+    if (!entry.exists) return;
+    const data = entry.data();
+    if (data.status !== 'queued') return;
+
+    const now = DateTime.utc();
+    tx.update(nextDoc.ref, {
+      status: 'active',
+      turnStartedAt: tsFromDateTime(now),
+      turnExpiresAt: tsFromDateTime(now.plus({ minutes: QUEUE_TURN_GRACE_MINUTES })),
+    });
+    tx.set(stateRef, { activeEntryId: nextEntryId, updatedAt: nowTs() }, { merge: true });
+  });
+
+  const activatedSnap = await nextDoc.ref.get();
+  if (!activatedSnap.exists) return;
+  const activated = activatedSnap.data();
+
+  await sendText(activated.senderId, `✅ It's your turn! Here's the current week's calendar.`);
+  await sendCalendarImage(activated.senderId, 'this');
+
+  // If user already sent a booking message while queued, process it now
+  if (activated.pendingBookingMessage) {
+    await handleActiveTurn(windowId, stateRef, nextEntryId);
+  } else {
+    await sendText(
+      activated.senderId,
+      `⚠️ Please send your booking details now. If you don't send an updated booking within ${QUEUE_TURN_GRACE_MINUTES} minutes, your turn will be forfeited.`
+    );
+  }
+}
+
+async function notifyQueueMovements(windowId) {
+  const snapshot = await firestore
+    .collection('queueEntries')
+    .where('windowId', '==', windowId)
+    .orderBy('createdAt')
+    .get();
+
+  const activeStatuses = new Set(['queued', 'active', 'waiting_new_booking']);
+  const entries = snapshot.docs.map(d => ({ id: d.id, ref: d.ref, ...d.data() })).filter(e => activeStatuses.has(e.status));
+
+  // Positions are by createdAt among active statuses
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.status !== 'queued') continue; // only notify queued users
+
+    const position = i + 1;
+    const last = e.lastNotifiedPosition;
+
+    if (last == null) {
+      await e.ref.update({ lastNotifiedPosition: position });
+      continue;
+    }
+
+    if (last - position >= QUEUE_NOTIFY_MOVE_BY) {
+      await sendText(e.senderId, `✅ You moved up in the queue — you're now #${position}.`);
+      await e.ref.update({ lastNotifiedPosition: position });
+    }
+  }
+}
+
+async function handleActiveTurn(windowId, stateRef, entryId) {
+  const entryRef = firestore.collection('queueEntries').doc(entryId);
+  const entrySnap = await entryRef.get();
+  if (!entrySnap.exists) {
+    await stateRef.set({ activeEntryId: null, updatedAt: nowTs() }, { merge: true });
+    return;
+  }
+
+  const entry = entrySnap.data();
+  if (entry.windowId !== windowId) {
+    // Active entry belongs to previous window; clear it
+    await stateRef.set({ activeEntryId: null, updatedAt: nowTs() }, { merge: true });
+    return;
+  }
+
+  // Forfeit if expired and still waiting for new booking
+  const expires = entry.turnExpiresAt?.toDate?.() || null;
+  if (expires && new Date() > expires && (entry.status === 'active' || entry.status === 'waiting_new_booking')) {
+    // If they already sent something and it was processed, don't forfeit here; otherwise forfeit
+    const hasPending =
+      entry.pendingBookingUpdatedAt &&
+      (!entry.lastProcessedBookingUpdatedAt ||
+        entry.pendingBookingUpdatedAt.toMillis() > entry.lastProcessedBookingUpdatedAt.toMillis());
+
+    if (!hasPending) {
+      await entryRef.update({ status: 'forfeited' });
+      await sendText(entry.senderId, '❌ Your turn expired (no updated booking received in time). Please re-queue if you still want to book.');
+      await stateRef.set({ activeEntryId: null, updatedAt: nowTs() }, { merge: true });
+      return;
+    }
+  }
+
+  // Process latest pending booking message if it has not been processed yet
+  const pendingUpdatedAt = entry.pendingBookingUpdatedAt || null;
+  const lastProcessedAt = entry.lastProcessedBookingUpdatedAt || null;
+  const shouldProcess =
+    entry.pendingBookingMessage &&
+    pendingUpdatedAt &&
+    (!lastProcessedAt || pendingUpdatedAt.toMillis() > lastProcessedAt.toMillis());
+
+  if (!shouldProcess) return;
+
+  const result = await processBookingRequestSilently(entry.senderId, entry.pendingBookingMessage);
+
+  // Always send booking summary for turn processing
+  if (result?.summaryText) {
+    await sendText(entry.senderId, result.summaryText);
+  }
+
+  const allAccepted = result.invalid.length === 0 && result.conflicts.length === 0 && result.confirmed.length > 0;
+  const anyRejected = result.invalid.length > 0 || result.conflicts.length > 0;
+
+  if (anyRejected) {
+    const now = DateTime.utc();
+    await entryRef.update({
+      status: 'waiting_new_booking',
+      lastProcessedBookingUpdatedAt: pendingUpdatedAt,
+      turnExpiresAt: tsFromDateTime(now.plus({ minutes: QUEUE_TURN_GRACE_MINUTES })),
+      result: {
+        confirmed: result.confirmed,
+        conflicts: result.conflicts,
+        invalid: result.invalid,
+      },
+    });
+
+    await sendText(
+      entry.senderId,
+      `⚠️ Some bookings could not be accepted. Please send an updated booking message within ${QUEUE_TURN_GRACE_MINUTES} minutes or your turn will be forfeited.`
+    );
+    return;
+  }
+
+  if (allAccepted) {
+    await entryRef.update({
+      status: 'completed',
+      lastProcessedBookingUpdatedAt: pendingUpdatedAt,
+      result: {
+        confirmed: result.confirmed,
+        conflicts: result.conflicts,
+        invalid: result.invalid,
+      },
+    });
+    await stateRef.set({ activeEntryId: null, updatedAt: nowTs() }, { merge: true });
+  }
 }
 
 async function sendCancelRedirect(senderId) {
